@@ -6,40 +6,32 @@
 # where <RUN> is either 20251026T170002Z or 20251026170002.
 # Output:
 #   gs://<bucket>/<STRUCTURED_PREFIX>/run_id=<RUN>/jsonl/<post_id>.jsonl
-
 import os
 import re
 import json
 import logging
 import traceback
 from datetime import datetime, timezone
-
 from flask import Request, jsonify
 from google.api_core import retry as gax_retry
 from google.cloud import storage
-
 # -------------------- ENV --------------------
 PROJECT_ID         = os.getenv("PROJECT_ID")
 BUCKET_NAME        = os.getenv("GCS_BUCKET")                        # REQUIRED
 SCRAPES_PREFIX     = os.getenv("SCRAPES_PREFIX", "scrapes")         # input
 STRUCTURED_PREFIX  = os.getenv("STRUCTURED_PREFIX", "structured")   # output
-
 # Accept BOTH run id styles:
 RUN_ID_ISO_RE   = re.compile(r"^\d{8}T\d{6}Z$")  # 20251026T170002Z
 RUN_ID_PLAIN_RE = re.compile(r"^\d{14}$")        # 20251026170002
-
 READ_RETRY = gax_retry.Retry(
     predicate=gax_retry.if_transient_error,
     initial=1.0, maximum=10.0, multiplier=2.0, deadline=120.0
 )
-
 storage_client = storage.Client()
-
 # -------------------- SIMPLE REGEX EXTRACTORS --------------------
 PRICE_RE      = re.compile(r"\$\s?([0-9,]+)")
 YEAR_RE       = re.compile(r"\b(19|20)\d{2}\b")
 MAKE_MODEL_RE = re.compile(r"\b([A-Z][a-z]+)\s+([A-Z][A-Za-z0-9]+)")
-
 # -------------------- HELPERS --------------------
 def _list_run_ids(bucket: str, scrapes_prefix: str) -> list[str]:
     """
@@ -51,7 +43,6 @@ def _list_run_ids(bucket: str, scrapes_prefix: str) -> list[str]:
     it = storage_client.list_blobs(bucket, prefix=f"{scrapes_prefix}/", delimiter="/")
     for _ in it:
         pass  # populate it.prefixes
-
     run_ids: list[str] = []
     for pref in getattr(it, "prefixes", []):
         # e.g., 'scrapes/run_id=20251026T170002Z/' OR 'scrapes/20251026170002/'
@@ -60,7 +51,6 @@ def _list_run_ids(bucket: str, scrapes_prefix: str) -> list[str]:
         if RUN_ID_ISO_RE.match(cand) or RUN_ID_PLAIN_RE.match(cand):
             run_ids.append(cand)
     return sorted(run_ids)
-
 def _txt_objects_for_run(run_id: str) -> list[str]:
     """
     Return .txt object names for a given run_id.
@@ -82,18 +72,15 @@ def _txt_objects_for_run(run_id: str) -> list[str]:
         if names:
             return names
     return []
-
 def _download_text(blob_name: str) -> str:
     bucket = storage_client.bucket(BUCKET_NAME)
     blob = bucket.blob(blob_name)
     return blob.download_as_text(retry=READ_RETRY, timeout=120)
-
 def _upload_jsonl_line(blob_name: str, record: dict):
     bucket = storage_client.bucket(BUCKET_NAME)
     blob = bucket.blob(blob_name)
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
     blob.upload_from_string(line, content_type="application/x-ndjson")
-
 def _parse_run_id_as_iso(run_id: str) -> str:
     """Normalize either run_id style to ISO8601 Z (fallback = now UTC)."""
     try:
@@ -106,30 +93,25 @@ def _parse_run_id_as_iso(run_id: str) -> str:
         return dt.isoformat().replace("+00:00", "Z")
     except Exception:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
 # -------------------- PARSE A LISTING --------------------
 def parse_listing(text: str) -> dict:
     d = {}
-
     m = PRICE_RE.search(text)
     if m:
         try:
             d["price"] = int(m.group(1).replace(",", ""))
         except ValueError:
             pass
-
     y = YEAR_RE.search(text)
     if y:
         try:
             d["year"] = int(y.group(0))
         except ValueError:
             pass
-
     mm = MAKE_MODEL_RE.search(text)
     if mm:
         d["make"] = mm.group(1)
         d["model"] = mm.group(2)
-
     # mileage variants
     mi = None
     m1 = re.search(r"(?:mileage|odometer)\s*[:\-]?\s*([\d,]+)", text, re.I)
@@ -149,8 +131,39 @@ def parse_listing(text: str) -> dict:
     if mi is not None:
         d["mileage"] = mi
 
-    return d
+    # --- NEW FIELDS (v2) ---
 
+    # cylinders: "6 cylinders", "4 cyl", "v6", "v8", etc.
+    cyl = re.search(r"\b[vV]?\s*([468])\s*(?:cyl(?:inder)?s?)\b", text, re.I)
+    if not cyl:
+        cyl = re.search(r"\b([vV]\s*[468])\b", text)
+    if cyl:
+        d["cylinders"] = cyl.group(1).strip().upper().replace(" ", "")
+
+    # drive_type: 4wd, fwd, rwd, awd, 4x4, etc.
+    drv = re.search(
+        r"\b(4[xX]4|4[wW][dD]|[aAfFrR][wW][dD]|"
+        r"four[\s\-]?wheel[\s\-]?drive|all[\s\-]?wheel[\s\-]?drive|"
+        r"front[\s\-]?wheel[\s\-]?drive|rear[\s\-]?wheel[\s\-]?drive)\b",
+        text, re.I
+    )
+    if drv:
+        raw_drv = drv.group(1).lower().replace("-", " ").strip()
+        if "four" in raw_drv or "4x4" in raw_drv or "4wd" in raw_drv:
+            d["drive_type"] = "4WD"
+        elif "all" in raw_drv or "awd" in raw_drv:
+            d["drive_type"] = "AWD"
+        elif "front" in raw_drv or "fwd" in raw_drv:
+            d["drive_type"] = "FWD"
+        elif "rear" in raw_drv or "rwd" in raw_drv:
+            d["drive_type"] = "RWD"
+
+    # condition: new, like new, excellent, good, fair, salvage
+    cond = re.search(r"condition\s*[:\-]?\s*(new|like new|excellent|good|fair|salvage)", text, re.I)
+    if cond:
+        d["condition"] = cond.group(1).strip().lower()
+
+    return d
 # -------------------- HTTP ENTRY --------------------
 def extract_http(request: Request):
     """
@@ -160,42 +173,33 @@ def extract_http(request: Request):
       { "run_id": "<...>", "max_files": 0, "overwrite": false }
     """
     logging.getLogger().setLevel(logging.INFO)
-
     if not BUCKET_NAME:
         return jsonify({"ok": False, "error": "missing GCS_BUCKET env"}), 500
-
     try:
         body = request.get_json(silent=True) or {}
     except Exception:
         body = {}
-
     run_id    = body.get("run_id")
     max_files = int(body.get("max_files") or 0)        # 0 = unlimited
     overwrite = bool(body.get("overwrite") or False)
-
     # Pick newest run if not provided
     if not run_id:
         runs = _list_run_ids(BUCKET_NAME, SCRAPES_PREFIX)
         if not runs:
             return jsonify({"ok": False, "error": f"no run_ids found under {SCRAPES_PREFIX}/"}), 200
         run_id = runs[-1]
-
     scraped_at_iso = _parse_run_id_as_iso(run_id)
-
     txt_blobs = _txt_objects_for_run(run_id)
     if not txt_blobs:
         return jsonify({"ok": False, "run_id": run_id, "error": "no .txt files found for run"}), 200
     if max_files > 0:
         txt_blobs = txt_blobs[:max_files]
-
     processed = written = skipped = errors = 0
     bucket = storage_client.bucket(BUCKET_NAME)
-
     for name in txt_blobs:
         try:
             text = _download_text(name)
             fields = parse_listing(text)
-
             post_id = os.path.splitext(os.path.basename(name))[0]
             record = {
                 "post_id": post_id,
@@ -204,21 +208,16 @@ def extract_http(request: Request):
                 "source_txt": name,
                 **fields,
             }
-
             out_key = f"{STRUCTURED_PREFIX}/run_id={run_id}/jsonl/{post_id}.jsonl"
-
             if not overwrite and bucket.blob(out_key).exists():
                 skipped += 1
             else:
                 _upload_jsonl_line(out_key, record)
                 written += 1
-
         except Exception as e:
             errors += 1
             logging.error(f"Failed {name}: {e}\n{traceback.format_exc()}")
-
         processed += 1
-
     result = {
         "ok": True,
         "version": "extractor-v3-jsonl-flex",
