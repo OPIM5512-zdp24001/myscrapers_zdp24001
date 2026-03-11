@@ -18,7 +18,7 @@ jobs:
       - id: auth
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.DEPLOYER_SA }}
 
       - uses: google-github-actions/setup-gcloud@v2
@@ -27,7 +27,7 @@ jobs:
         run: |
           gcloud functions deploy materialize-v2 \
             --gen2 \
-            --region=${{ vars.GCP_REGION }} \
+            --region=${{ vars.REGION }} \
             --runtime=python312 \
             --source=cloud_function/materialize-v2 \
             --entry-point=materialize_http \
@@ -36,21 +36,21 @@ jobs:
             --memory=2Gi \
             --timeout=900s \
             --service-account=${{ vars.RUNTIME_SA }} \
-            --set-env-vars="GCS_BUCKET=${{ vars.GCS_BUCKET }},STRUCTURED_PREFIX=structured,CSV_BLOB_NAME=listings_master_v2.csv"
+            --set-env-vars="GCS_BUCKET=${{ vars.BUCKET_NAME }},STRUCTURED_PREFIX=structured,CSV_BLOB_NAME=listings_master_v2.csv"
 
       - name: Create or update scheduler job
         run: |
           gcloud scheduler jobs describe materialize-v2-trigger \
-            --location=${{ vars.GCP_REGION }} 2>/dev/null \
+            --location=${{ vars.REGION }} 2>/dev/null \
           && gcloud scheduler jobs update http materialize-v2-trigger \
-            --location=${{ vars.GCP_REGION }} \
+            --location=${{ vars.REGION }} \
             --schedule="16 * * * *" \
-            --uri="https://${{ vars.GCP_REGION }}-${{ vars.GCP_PROJECT }}.cloudfunctions.net/materialize-v2" \
+            --uri="https://${{ vars.REGION }}-${{ vars.PROJECT_ID }}.cloudfunctions.net/materialize-v2" \
             --http-method=POST \
             --oidc-service-account-email=${{ vars.RUNTIME_SA }} \
           || gcloud scheduler jobs create http materialize-v2-trigger \
-            --location=${{ vars.GCP_REGION }} \
+            --location=${{ vars.REGION }} \
             --schedule="16 * * * *" \
-            --uri="https://${{ vars.GCP_REGION }}-${{ vars.GCP_PROJECT }}.cloudfunctions.net/materialize-v2" \
+            --uri="https://${{ vars.REGION }}-${{ vars.PROJECT_ID }}.cloudfunctions.net/materialize-v2" \
             --http-method=POST \
             --oidc-service-account-email=${{ vars.RUNTIME_SA }}
