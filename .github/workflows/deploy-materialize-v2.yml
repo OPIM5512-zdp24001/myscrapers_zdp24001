@@ -1,0 +1,56 @@
+name: Deploy Materialize V2
+
+on:
+  schedule:
+    - cron: "16 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy materialize-v2
+        run: |
+          gcloud functions deploy materialize-v2 \
+            --gen2 \
+            --region=${{ vars.GCP_REGION }} \
+            --runtime=python312 \
+            --source=cloud_function/materialize-v2 \
+            --entry-point=materialize_http \
+            --trigger-http \
+            --no-allow-unauthenticated \
+            --memory=2Gi \
+            --timeout=900s \
+            --service-account=${{ vars.RUNTIME_SA }} \
+            --set-env-vars="GCS_BUCKET=${{ vars.GCS_BUCKET }},STRUCTURED_PREFIX=structured,CSV_BLOB_NAME=listings_master_v2.csv"
+
+      - name: Create or update scheduler job
+        run: |
+          gcloud scheduler jobs describe materialize-v2-trigger \
+            --location=${{ vars.GCP_REGION }} 2>/dev/null \
+          && gcloud scheduler jobs update http materialize-v2-trigger \
+            --location=${{ vars.GCP_REGION }} \
+            --schedule="16 * * * *" \
+            --uri="https://${{ vars.GCP_REGION }}-${{ vars.GCP_PROJECT }}.cloudfunctions.net/materialize-v2" \
+            --http-method=POST \
+            --oidc-service-account-email=${{ vars.RUNTIME_SA }} \
+          || gcloud scheduler jobs create http materialize-v2-trigger \
+            --location=${{ vars.GCP_REGION }} \
+            --schedule="16 * * * *" \
+            --uri="https://${{ vars.GCP_REGION }}-${{ vars.GCP_PROJECT }}.cloudfunctions.net/materialize-v2" \
+            --http-method=POST \
+            --oidc-service-account-email=${{ vars.RUNTIME_SA }}
