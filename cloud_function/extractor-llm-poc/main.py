@@ -9,6 +9,10 @@
 # 3. LLM_MODEL set to 'gemini-2.5-flash' (Fixes 404/NotFound error).
 # 4. "additionalProperties": False removed from schema (Fixes internal ParseError).
 # 5. Non-breaking spaces (U+00A0) replaced with standard spaces (U+0020). <--- FIX FOR THIS ERROR
+#
+# A07 UPDATE: Added new GenAI-extracted fields: title_status, color, transmission,
+#             fuel_type, body_style. These fields showcase LLM strengths over RegEx
+#             because they require understanding of natural language descriptions.
 
 import os
 import re
@@ -69,7 +73,7 @@ def _get_vertex_model() -> GenerativeModel:
     if _CACHED_MODEL_OBJ is None:
         if not PROJECT_ID:
             raise RuntimeError("PROJECT_ID environment variable is missing.")
-        
+
         # Initialize client once per container lifecycle
         vertexai.init(project=PROJECT_ID, location=REGION)
         _CACHED_MODEL_OBJ = GenerativeModel(LLM_MODEL)
@@ -156,37 +160,52 @@ def _safe_int(x):
 # -------------------- VERTEX AI CALL --------------------
 def _vertex_extract_fields(raw_text: str) -> dict:
     """
-    Ask Gemini to return JSON with exactly: price, year, make, model, mileage.
+    Ask Gemini to return JSON with:
+      price, year, make, model, mileage (original)
+      + title_status, color, transmission, fuel_type, body_style (A07 new fields)
     """
     model = _get_vertex_model()
 
-    # Strict JSON schema - FIX: Removed "additionalProperties": False
+    # ---- A07 UPDATED SCHEMA: added condition, color, transmission, fuel_type, body_style ----
     schema = {
         "type": "object",
         "properties": {
-            "price": {"type": "integer", "nullable": True},
-            "year": {"type": "integer", "nullable": True},
-            "make": {"type": "string", "nullable": True},
-            "model": {"type": "string", "nullable": True},
-            "mileage": {"type": "integer", "nullable": True},
+            "price":        {"type": "integer", "nullable": True},
+            "year":         {"type": "integer", "nullable": True},
+            "make":         {"type": "string",  "nullable": True},
+            "model":        {"type": "string",  "nullable": True},
+            "mileage":      {"type": "integer", "nullable": True},
+            # --- NEW A07 FIELDS ---
+            "title_status": {"type": "string",  "nullable": True},
+            "color":        {"type": "string",  "nullable": True},
+            "transmission": {"type": "string",  "nullable": True},
+            "fuel_type":    {"type": "string",  "nullable": True},
+            "body_style":   {"type": "string",  "nullable": True},
         },
+        # NOTE: only original fields are required — new fields are optional
+        # so Gemini doesn't hallucinate values just to fill them in
         "required": ["price", "year", "make", "model", "mileage"]
     }
 
-    # System instruction (will be prepended to the prompt)
+    # System instruction merged into prompt
     sys_instr = (
         "Extract ONLY the following fields from the input text. "
         "Return a strict JSON object that conforms to the provided schema. "
         "If a value is not present, use null. "
         "Rules: integers for price/year/mileage; price in USD; mileage in miles; "
-        "do not infer values not explicitly present; do not add extra keys."
+        "do not infer values not explicitly present; do not add extra keys. "
+        # --- A07: additional guidance for new fields ---
+        "For 'title_status', use one of: clean, salvage, rebuilt, lemon, missing — or null if not mentioned. "
+        "For 'color', extract the exterior color mentioned (e.g. 'red', 'silver', 'black'). "
+        "For 'transmission', use one of: automatic, manual, cvt — or null if not stated. "
+        "For 'fuel_type', use one of: gasoline, diesel, electric, hybrid, plugin_hybrid — or null. "
+        "For 'body_style', use one of: sedan, suv, truck, coupe, convertible, van, wagon, hatchback — or null."
     )
 
-    # FIX: Combine instruction and text into one prompt string (SDK compatibility)
+    # Combine instruction and text into one prompt string
     prompt = f"{sys_instr}\n\nTEXT:\n{raw_text}"
 
     gen_cfg = GenerationConfig(
-        # FIX: system_instruction removed to fix TypeError 
         temperature=0.0,
         top_p=1.0,
         top_k=40,
@@ -200,15 +219,13 @@ def _vertex_extract_fields(raw_text: str) -> dict:
     resp = None
     for attempt in range(max_attempts):
         try:
-            # Pass the single string prompt
             resp = model.generate_content(prompt, generation_config=gen_cfg)
             break
         except Exception as e:
-            # Includes the 404/NotFound error from the previous run
             if not _if_llm_retryable(e) or attempt == max_attempts - 1:
                 logging.error(f"Fatal/non-retryable LLM error or max retries reached: {e}")
                 raise
-            
+
             sleep_time = LLM_RETRY._calculate_sleep(attempt)
             logging.warning(f"Transient LLM error on attempt {attempt+1}/{max_attempts}. Retrying in {sleep_time:.2f}s...")
             time.sleep(sleep_time)
@@ -222,14 +239,20 @@ def _vertex_extract_fields(raw_text: str) -> dict:
     parsed["price"] = _safe_int(parsed.get("price"))
     parsed["year"] = _safe_int(parsed.get("year"))
     parsed["mileage"] = _safe_int(parsed.get("mileage"))
-    
+
     def _norm_str(s):
         if s is None: return None
-        s = str(s).strip()
+        s = str(s).strip().lower()
         return s if s else None
 
     parsed["make"] = _norm_str(parsed.get("make"))
     parsed["model"] = _norm_str(parsed.get("model"))
+    # --- A07: normalize new string fields ---
+    parsed["title_status"] = _norm_str(parsed.get("title_status"))
+    parsed["color"] = _norm_str(parsed.get("color"))
+    parsed["transmission"] = _norm_str(parsed.get("transmission"))
+    parsed["fuel_type"] = _norm_str(parsed.get("fuel_type"))
+    parsed["body_style"] = _norm_str(parsed.get("body_style"))
 
     return parsed
 
@@ -307,7 +330,7 @@ def llm_extract_http(request: Request):
 
             parsed = _vertex_extract_fields(raw_listing)
 
-            # Compose final record
+            # Compose final record — includes A07 new fields
             out_record = {
                 "post_id": post_id,
                 "run_id": base_rec.get("run_id", run_id),
@@ -318,6 +341,13 @@ def llm_extract_http(request: Request):
                 "make": parsed.get("make"),
                 "model": parsed.get("model"),
                 "mileage": parsed.get("mileage"),
+                # --- A07 NEW FIELDS ---
+                "title_status": parsed.get("title_status"),
+                "color": parsed.get("color"),
+                "transmission": parsed.get("transmission"),
+                "fuel_type": parsed.get("fuel_type"),
+                "body_style": parsed.get("body_style"),
+                # --- metadata ---
                 "llm_provider": "vertex",
                 "llm_model": LLM_MODEL,
                 "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
