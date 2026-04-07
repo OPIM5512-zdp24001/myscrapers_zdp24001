@@ -1,0 +1,8 @@
+flask
+gunicorn
+google-cloud-storage
+pandas
+numpy
+scikit-learn
+optuna
+matplotlib
