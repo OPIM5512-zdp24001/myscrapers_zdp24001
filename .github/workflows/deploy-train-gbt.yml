@@ -1,0 +1,51 @@
+name: Deploy train-gbt
+
+on:
+  push:
+    paths:
+      - "cloud_function/train-gbt/**"
+  workflow_dispatch:
+
+env:
+  PROJECT_ID:    myscrapers-zdp24001
+  REGION:        us-central1
+  FUNCTION_NAME: train-gbt
+  FUNCTION_DIR:  cloud_function/train-gbt
+  ENTRY_POINT:   train_gbt_http
+  RUNTIME:       python312
+  GCS_BUCKET:    myscrapers-zdp24001
+  DATA_KEY:      structured/datasets/listings_master_llm.csv
+  OUTPUT_PREFIX: preds_gbt
+  CRON_EXPR:     "30 * * * *"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account:            ${{ secrets.WIF_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Cloud Function
+        run: |
+          gcloud functions deploy ${{ env.FUNCTION_NAME }} \
+            --gen2 \
+            --region=${{ env.REGION }} \
+            --runtime=${{ env.RUNTIME }} \
+            --source=${{ env.FUNCTION_DIR }} \
+            --entry-point=${{ env.ENTRY_POINT }} \
+            --trigger-http \
+            --allow-unauthenticated \
+            --timeout=540s \
+            --memory=1Gi \
+            --set-env-vars="PROJECT_ID=${{ env.PROJECT_ID }},GCS_BUCKET=${{ env.GCS_BUCKET }},DATA_KEY=${{ env.DATA_KEY }},OUTPUT_PREFIX=${{ env.OUTPUT_PREFIX }}"
