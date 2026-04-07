@@ -1,0 +1,39 @@
+name: Sync data from GCS to GitHub
+
+on:
+  schedule:
+    - cron: "45 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account:            ${{ secrets.WIF_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sync predictions from GCS
+        run: |
+          mkdir -p results
+          gsutil -m rsync -r gs://${{ vars.BUCKET_NAME }}/preds/ results/preds/ 2>/dev/null || true
+          gsutil -m rsync -r gs://${{ vars.BUCKET_NAME }}/preds_gbt/ results/preds_gbt/ 2>/dev/null || true
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add results/
+          git diff --staged --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Sync predictions from GCS [skip ci]"
+          git push
